@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import random
 import sys
@@ -120,6 +121,25 @@ def save_checkpoint(
     torch.save(checkpoint, path)
 
 
+def write_metrics(output_dir: Path, rows: list[dict[str, object]]) -> None:
+    """Persist completed epoch metrics in CSV and JSON formats."""
+    fieldnames = [
+        "epoch",
+        "train_loss",
+        "val_foreground_mIoU",
+        "learning_rate",
+        "best_checkpoint_path",
+    ]
+    csv_path = output_dir / "metrics.csv"
+    json_path = output_dir / "metrics.json"
+
+    with csv_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    json_path.write_text(json.dumps(rows, indent=2))
+
+
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
@@ -151,6 +171,7 @@ def main() -> None:
         f"Training from scratch on {len(train_dataset)} train masks; "
         f"validating on {len(val_dataset)} public masks; device={device}"
     )
+    metric_rows: list[dict[str, object]] = []
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
@@ -178,13 +199,26 @@ def main() -> None:
 
         train_loss = running_loss / max(1, seen)
         val_miou = validate(model, val_loader, device, desc=f"epoch {epoch}/{args.epochs} val")
-        print(f"epoch {epoch}: train_loss={train_loss:.4f} val_foreground_mIoU={val_miou:.5f}")
+        learning_rate = float(optimizer.param_groups[0]["lr"])
 
         save_checkpoint(args.output_dir / "last.pt", model, optimizer, epoch, val_miou, args)
+        best_checkpoint_path = ""
         if val_miou > best_miou:
             best_miou = val_miou
-            save_checkpoint(args.output_dir / "best.pt", model, optimizer, epoch, val_miou, args)
-            print(f"saved new best checkpoint: {args.output_dir / 'best.pt'}")
+            best_path = args.output_dir / "best.pt"
+            save_checkpoint(best_path, model, optimizer, epoch, val_miou, args)
+            best_checkpoint_path = str(best_path)
+
+        epoch_metrics = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_foreground_mIoU": val_miou,
+            "learning_rate": learning_rate,
+            "best_checkpoint_path": best_checkpoint_path,
+        }
+        metric_rows.append(epoch_metrics)
+        write_metrics(args.output_dir, metric_rows)
+        print(f"epoch_metrics: {json.dumps(epoch_metrics, sort_keys=True)}")
 
 
 if __name__ == "__main__":
