@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm.auto import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,7 +88,7 @@ def dump_flat_yaml(path: Path, config: dict[str, object]) -> None:
     lines = []
     for key, value in config.items():
         if value is None:
-            lines.append(f"{key}:")
+            lines.append(f"{key}: null")
         else:
             lines.append(f"{key}: {value}")
     path.write_text("\n".join(lines) + "\n")
@@ -206,7 +206,7 @@ def resolve_device(name: str) -> torch.device:
 
 
 def make_loader(
-    dataset: torch.utils.data.Dataset,
+    dataset: Dataset,
     batch_size: int,
     shuffle: bool,
     num_workers: int,
@@ -220,6 +220,18 @@ def make_loader(
         pin_memory=device.type == "cuda",
         persistent_workers=num_workers > 0,
     )
+
+
+def apply_deterministic_limit(dataset: Dataset, max_samples: int | None, seed: int, name: str) -> Dataset:
+    """Use a deterministic seed-selected subset for quick/debug runs."""
+    if max_samples is None:
+        return dataset
+    if max_samples < 1:
+        raise ValueError(f"--max-{name}-samples must be positive or null")
+    limit = min(max_samples, len(dataset))
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(len(dataset), generator=generator)[:limit].tolist()
+    return Subset(dataset, indices)
 
 
 def foreground_dice_loss(logits: torch.Tensor, target: torch.Tensor, smooth: float = 1.0) -> torch.Tensor:
@@ -348,15 +360,25 @@ def main() -> None:
     (args.output_dir / "config_used.json").write_text(json.dumps(resolved_config, indent=2, sort_keys=True))
     dump_flat_yaml(args.output_dir / "resolved_config.yaml", resolved_config)
 
-    train_dataset = TrainSegmentationDataset(
+    full_train_dataset = TrainSegmentationDataset(
         args.data_root,
         transform=SegmentationTrainTransform(args.image_size),
-        max_items=args.max_train_samples,
     )
-    val_dataset = ValidationSegmentationDataset(
+    full_val_dataset = ValidationSegmentationDataset(
         args.data_root,
         image_transform=ImageResizeTransform(args.image_size),
-        max_items=args.max_val_samples,
+    )
+    train_dataset = apply_deterministic_limit(
+        full_train_dataset,
+        args.max_train_samples,
+        args.seed,
+        "train",
+    )
+    val_dataset = apply_deterministic_limit(
+        full_val_dataset,
+        args.max_val_samples,
+        args.seed + 1,
+        "val",
     )
     train_loader = make_loader(train_dataset, args.batch_size, True, args.num_workers, device)
     # Validation keeps original masks and upsamples logits to their exact size,
@@ -370,6 +392,10 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
     best_miou = -1.0
+    print(
+        f"Using {len(train_dataset)}/{len(full_train_dataset)} train samples and "
+        f"{len(val_dataset)}/{len(full_val_dataset)} validation samples"
+    )
     print(
         f"Training from scratch on {len(train_dataset)} train masks; "
         f"validating on {len(val_dataset)} public masks; device={device}; "
