@@ -30,35 +30,161 @@ from cse164cv.metrics import foreground_miou, update_hist_from_logits  # noqa: E
 from cse164cv.models import SmallUNet  # noqa: E402
 
 
-def parse_args() -> argparse.Namespace:
+DEFAULT_CONFIG = {
+    "data_root": "data",
+    "output_dir": "outputs/seg_baseline",
+    "epochs": 5,
+    "batch_size": 8,
+    "image_size": 256,
+    "base_channels": 32,
+    "learning_rate": 1e-3,
+    "weight_decay": 1e-4,
+    "background_loss_weight": 0.05,
+    "dice_weight": 0.0,
+    "num_workers": 2,
+    "seed": 164,
+    "device": "auto",
+    "max_train_samples": None,
+    "max_val_samples": None,
+    "log_interval": 25,
+}
+
+
+def parse_yaml_scalar(value: str) -> object:
+    value = value.strip()
+    if value == "" or value.lower() in {"null", "none"}:
+        return None
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    return value.strip("\"'")
+
+
+def load_flat_yaml(path: Path) -> dict[str, object]:
+    """Load this project's flat key-value YAML config without extra deps."""
+    config: dict[str, object] = {}
+    for line_number, raw_line in enumerate(path.read_text().splitlines(), start=1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if ":" not in line:
+            raise ValueError(f"{path}:{line_number}: expected 'key: value'")
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"{path}:{line_number}: empty config key")
+        config[key] = parse_yaml_scalar(value)
+    return config
+
+
+def dump_flat_yaml(path: Path, config: dict[str, object]) -> None:
+    lines = []
+    for key, value in config.items():
+        if value is None:
+            lines.append(f"{key}:")
+        else:
+            lines.append(f"{key}: {value}")
+    path.write_text("\n".join(lines) + "\n")
+
+
+def jsonable_config(args: argparse.Namespace) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in vars(args).items():
+        if isinstance(value, Path):
+            result[key] = str(value)
+        else:
+            result[key] = value
+    return result
+
+
+def important_hyperparameters(args: argparse.Namespace) -> dict[str, object]:
+    keys = [
+        "data_root",
+        "output_dir",
+        "epochs",
+        "batch_size",
+        "image_size",
+        "base_channels",
+        "learning_rate",
+        "weight_decay",
+        "background_loss_weight",
+        "dice_weight",
+        "num_workers",
+        "seed",
+        "device",
+        "max_train_samples",
+        "max_val_samples",
+        "log_interval",
+        "config",
+    ]
+    all_values = jsonable_config(args)
+    return {key: all_values[key] for key in keys}
+
+
+def make_parser(defaults: dict[str, object] | None = None) -> argparse.ArgumentParser:
+    defaults = defaults or {}
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", type=Path, default=Path("data"))
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/seg_baseline"))
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--image-size", type=int, default=256)
-    parser.add_argument("--base-channels", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--config", type=Path, help="Flat YAML config file for segmentation training.")
+
+    def default(name: str) -> object:
+        return defaults.get(name, argparse.SUPPRESS)
+
+    parser.add_argument("--data-root", type=Path, default=default("data_root"))
+    parser.add_argument("--output-dir", type=Path, default=default("output_dir"))
+    parser.add_argument("--epochs", type=int, default=default("epochs"))
+    parser.add_argument("--batch-size", type=int, default=default("batch_size"))
+    parser.add_argument("--image-size", type=int, default=default("image_size"))
+    parser.add_argument("--base-channels", type=int, default=default("base_channels"))
+    parser.add_argument("--learning-rate", "--lr", dest="learning_rate", type=float, default=default("learning_rate"))
+    parser.add_argument("--weight-decay", type=float, default=default("weight_decay"))
     parser.add_argument(
         "--background-loss-weight",
         type=float,
-        default=0.05,
+        default=default("background_loss_weight"),
         help="Cross-entropy weight for background id 0; foreground ids 1..300 keep weight 1.0.",
     )
     parser.add_argument(
         "--dice-weight",
         type=float,
-        default=0.0,
+        default=default("dice_weight"),
         help="Weight for optional foreground Dice loss. Default 0.0 disables Dice loss.",
     )
-    parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--seed", type=int, default=164)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
-    parser.add_argument("--max-train-samples", type=int)
-    parser.add_argument("--max-val-samples", type=int)
-    parser.add_argument("--log-interval", type=int, default=25)
-    return parser.parse_args()
+    parser.add_argument("--num-workers", type=int, default=default("num_workers"))
+    parser.add_argument("--seed", type=int, default=default("seed"))
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default=default("device"))
+    parser.add_argument("--max-train-samples", type=int, default=default("max_train_samples"))
+    parser.add_argument("--max-val-samples", type=int, default=default("max_val_samples"))
+    parser.add_argument("--log-interval", type=int, default=default("log_interval"))
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", type=Path)
+    config_args, _ = config_parser.parse_known_args()
+
+    config_values: dict[str, object] = {}
+    if config_args.config:
+        config_values = load_flat_yaml(config_args.config)
+        unknown = sorted(set(config_values) - set(DEFAULT_CONFIG))
+        if unknown:
+            raise ValueError(f"Unknown config keys in {config_args.config}: {unknown}")
+
+    merged_defaults = {**DEFAULT_CONFIG, **config_values}
+    parser = make_parser(merged_defaults)
+    cli_args = vars(parser.parse_args())
+    resolved = {**merged_defaults, **cli_args}
+    resolved["config"] = str(config_args.config) if config_args.config else None
+    resolved["data_root"] = Path(resolved["data_root"])
+    resolved["output_dir"] = Path(resolved["output_dir"])
+    return argparse.Namespace(**resolved)
 
 
 def seed_everything(seed: int) -> None:
@@ -162,6 +288,8 @@ def save_checkpoint(
             "base_channels": args.base_channels,
             "num_seg_classes": NUM_SEG_CLASSES,
             "ignore_index": IGNORE_INDEX,
+            "learning_rate": args.learning_rate,
+            "weight_decay": args.weight_decay,
             "background_loss_weight": args.background_loss_weight,
             "dice_weight": args.dice_weight,
         },
@@ -191,6 +319,23 @@ def write_metrics(output_dir: Path, rows: list[dict[str, object]]) -> None:
     json_path.write_text(json.dumps(rows, indent=2))
 
 
+def write_summary(output_dir: Path, rows: list[dict[str, object]], args: argparse.Namespace) -> None:
+    if not rows:
+        return
+    best_row = max(rows, key=lambda row: float(row["val_foreground_mIoU"]))
+    final_row = rows[-1]
+    summary = {
+        "best_epoch": int(best_row["epoch"]),
+        "best_val_foreground_mIoU": float(best_row["val_foreground_mIoU"]),
+        "best_checkpoint_path": str(output_dir / "best.pt"),
+        "final_epoch": int(final_row["epoch"]),
+        "final_train_loss": float(final_row["train_loss"]),
+        "final_val_foreground_mIoU": float(final_row["val_foreground_mIoU"]),
+        "hyperparameters": important_hyperparameters(args),
+    }
+    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True))
+
+
 def main() -> None:
     args = parse_args()
     if args.dice_weight < 0:
@@ -198,7 +343,10 @@ def main() -> None:
     seed_everything(args.seed)
     device = resolve_device(args.device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    (args.output_dir / "args.json").write_text(json.dumps(vars(args), indent=2, default=str))
+    resolved_config = jsonable_config(args)
+    (args.output_dir / "args.json").write_text(json.dumps(resolved_config, indent=2, sort_keys=True))
+    (args.output_dir / "config_used.json").write_text(json.dumps(resolved_config, indent=2, sort_keys=True))
+    dump_flat_yaml(args.output_dir / "resolved_config.yaml", resolved_config)
 
     train_dataset = TrainSegmentationDataset(
         args.data_root,
@@ -219,7 +367,7 @@ def main() -> None:
     class_weights = torch.ones(NUM_SEG_CLASSES, dtype=torch.float32, device=device)
     class_weights[0] = args.background_loss_weight
     ce_criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=IGNORE_INDEX)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
     best_miou = -1.0
     print(
@@ -281,6 +429,7 @@ def main() -> None:
         }
         metric_rows.append(epoch_metrics)
         write_metrics(args.output_dir, metric_rows)
+        write_summary(args.output_dir, metric_rows, args)
         print(f"epoch_metrics: {json.dumps(epoch_metrics, sort_keys=True)}")
 
 

@@ -1,0 +1,17 @@
+data_root: data
+output_dir: outputs/seg_weighted_dice_256
+epochs: 20
+batch_size: 8
+image_size: 256
+base_channels: 32
+learning_rate: 0.001
+weight_decay: 0.0001
+background_loss_weight: 0.01
+dice_weight: 1.0
+num_workers: 2
+seed: 164
+device: auto
+max_train_samples:
+max_val_samples:
+log_interval: 25
+
