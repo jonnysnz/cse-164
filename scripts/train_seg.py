@@ -40,6 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-channels", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--background-loss-weight",
+        type=float,
+        default=0.05,
+        help="Cross-entropy weight for background id 0; foreground ids 1..300 keep weight 1.0.",
+    )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=164)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
@@ -85,7 +91,7 @@ def make_loader(
 
 
 @torch.no_grad()
-def validate(model: nn.Module, loader: DataLoader, device: torch.device, desc: str) -> float:
+def validate(model: nn.Module, loader: DataLoader, device: torch.device, desc: str) -> dict[str, float]:
     model.eval()
     hist = np.zeros((NUM_SEG_CLASSES, NUM_SEG_CLASSES), dtype=np.int64)
     for batch in tqdm(loader, total=len(loader), desc=desc, leave=False):
@@ -94,7 +100,13 @@ def validate(model: nn.Module, loader: DataLoader, device: torch.device, desc: s
         logits = model(images)
         hist = update_hist_from_logits(hist, logits, masks)
     miou, _ = foreground_miou(hist)
-    return miou
+    valid_pixels = max(1, int(hist.sum()))
+    return {
+        "val_foreground_mIoU": miou,
+        "val_gt_foreground_fraction": float(hist[1:, :].sum() / valid_pixels),
+        "val_pred_foreground_fraction": float(hist[:, 1:].sum() / valid_pixels),
+        "val_pred_foreground_classes": int(np.count_nonzero(hist[:, 1:].sum(axis=0))),
+    }
 
 
 def save_checkpoint(
@@ -116,6 +128,7 @@ def save_checkpoint(
             "base_channels": args.base_channels,
             "num_seg_classes": NUM_SEG_CLASSES,
             "ignore_index": IGNORE_INDEX,
+            "background_loss_weight": args.background_loss_weight,
         },
     }
     torch.save(checkpoint, path)
@@ -127,6 +140,9 @@ def write_metrics(output_dir: Path, rows: list[dict[str, object]]) -> None:
         "epoch",
         "train_loss",
         "val_foreground_mIoU",
+        "val_gt_foreground_fraction",
+        "val_pred_foreground_fraction",
+        "val_pred_foreground_classes",
         "learning_rate",
         "best_checkpoint_path",
     ]
@@ -163,13 +179,16 @@ def main() -> None:
     val_loader = make_loader(val_dataset, 1, False, args.num_workers, device)
 
     model = SmallUNet(num_classes=NUM_SEG_CLASSES, base_channels=args.base_channels).to(device)
-    criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
+    class_weights = torch.ones(NUM_SEG_CLASSES, dtype=torch.float32, device=device)
+    class_weights[0] = args.background_loss_weight
+    criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=IGNORE_INDEX)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_miou = -1.0
     print(
         f"Training from scratch on {len(train_dataset)} train masks; "
-        f"validating on {len(val_dataset)} public masks; device={device}"
+        f"validating on {len(val_dataset)} public masks; device={device}; "
+        f"background_loss_weight={args.background_loss_weight}"
     )
     metric_rows: list[dict[str, object]] = []
     for epoch in range(1, args.epochs + 1):
@@ -198,7 +217,8 @@ def main() -> None:
             train_bar.set_postfix(train_loss=f"{running_loss / max(1, seen):.4f}")
 
         train_loss = running_loss / max(1, seen)
-        val_miou = validate(model, val_loader, device, desc=f"epoch {epoch}/{args.epochs} val")
+        val_metrics = validate(model, val_loader, device, desc=f"epoch {epoch}/{args.epochs} val")
+        val_miou = val_metrics["val_foreground_mIoU"]
         learning_rate = float(optimizer.param_groups[0]["lr"])
 
         save_checkpoint(args.output_dir / "last.pt", model, optimizer, epoch, val_miou, args)
@@ -212,7 +232,7 @@ def main() -> None:
         epoch_metrics = {
             "epoch": epoch,
             "train_loss": train_loss,
-            "val_foreground_mIoU": val_miou,
+            **val_metrics,
             "learning_rate": learning_rate,
             "best_checkpoint_path": best_checkpoint_path,
         }
