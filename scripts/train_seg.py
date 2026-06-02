@@ -46,6 +46,12 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
         help="Cross-entropy weight for background id 0; foreground ids 1..300 keep weight 1.0.",
     )
+    parser.add_argument(
+        "--dice-weight",
+        type=float,
+        default=0.0,
+        help="Weight for optional foreground Dice loss. Default 0.0 disables Dice loss.",
+    )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=164)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
@@ -90,6 +96,34 @@ def make_loader(
     )
 
 
+def foreground_dice_loss(logits: torch.Tensor, target: torch.Tensor, smooth: float = 1.0) -> torch.Tensor:
+    """Dice loss over foreground target classes, ignoring id 1000.
+
+    CE still handles all classes, including background. This auxiliary term only
+    compares channels 1..300 for foreground classes present in the current batch.
+    Keeping the Dice target set batch-local avoids building a huge 300-channel
+    one-hot tensor for every batch.
+    """
+    valid = target != IGNORE_INDEX
+    foreground = valid & (target > 0) & (target < NUM_SEG_CLASSES)
+    present_ids = torch.unique(target[foreground])
+    if present_ids.numel() == 0:
+        return logits.sum() * 0.0
+
+    probs = torch.softmax(logits, dim=1)
+    fg_probs = probs[:, present_ids, :, :]
+    fg_target = (target.unsqueeze(1) == present_ids.view(1, -1, 1, 1)).to(dtype=fg_probs.dtype)
+    valid_mask = valid.unsqueeze(1).to(dtype=fg_probs.dtype)
+
+    fg_probs = fg_probs * valid_mask
+    fg_target = fg_target * valid_mask
+    dims = (0, 2, 3)
+    intersection = (fg_probs * fg_target).sum(dim=dims)
+    denominator = fg_probs.sum(dim=dims) + fg_target.sum(dim=dims)
+    dice = (2.0 * intersection + smooth) / (denominator + smooth)
+    return 1.0 - dice.mean()
+
+
 @torch.no_grad()
 def validate(model: nn.Module, loader: DataLoader, device: torch.device, desc: str) -> dict[str, float]:
     model.eval()
@@ -129,6 +163,7 @@ def save_checkpoint(
             "num_seg_classes": NUM_SEG_CLASSES,
             "ignore_index": IGNORE_INDEX,
             "background_loss_weight": args.background_loss_weight,
+            "dice_weight": args.dice_weight,
         },
     }
     torch.save(checkpoint, path)
@@ -158,6 +193,8 @@ def write_metrics(output_dir: Path, rows: list[dict[str, object]]) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.dice_weight < 0:
+        raise ValueError("--dice-weight must be non-negative")
     seed_everything(args.seed)
     device = resolve_device(args.device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -181,14 +218,15 @@ def main() -> None:
     model = SmallUNet(num_classes=NUM_SEG_CLASSES, base_channels=args.base_channels).to(device)
     class_weights = torch.ones(NUM_SEG_CLASSES, dtype=torch.float32, device=device)
     class_weights[0] = args.background_loss_weight
-    criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=IGNORE_INDEX)
+    ce_criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=IGNORE_INDEX)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_miou = -1.0
     print(
         f"Training from scratch on {len(train_dataset)} train masks; "
         f"validating on {len(val_dataset)} public masks; device={device}; "
-        f"background_loss_weight={args.background_loss_weight}"
+        f"background_loss_weight={args.background_loss_weight}; "
+        f"dice_weight={args.dice_weight}"
     )
     metric_rows: list[dict[str, object]] = []
     for epoch in range(1, args.epochs + 1):
@@ -207,7 +245,12 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             logits = model(images)
-            loss = criterion(logits, masks)
+            ce_loss = ce_criterion(logits, masks)
+            if args.dice_weight > 0:
+                dice_loss = foreground_dice_loss(logits, masks)
+                loss = ce_loss + args.dice_weight * dice_loss
+            else:
+                loss = ce_loss
             loss.backward()
             optimizer.step()
 
