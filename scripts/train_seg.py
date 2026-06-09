@@ -82,6 +82,8 @@ RUN_ARTIFACT_NAMES = {
     "summary.json",
 }
 
+PROGRESS_BAR_FORMAT = "{desc:<14} {percentage:3.0f}%|{bar:18}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]"
+
 
 def parse_yaml_scalar(value: str) -> object:
     value = value.strip()
@@ -345,6 +347,73 @@ def ensure_finite_loss(loss: torch.Tensor, name: str, epoch: int, step: int) -> 
         )
 
 
+def format_duration(seconds: float) -> str:
+    seconds = max(0, round(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
+def print_run_summary(
+    args: argparse.Namespace,
+    device: torch.device,
+    use_bf16: bool,
+    trainable_parameters: int,
+    train_samples: int,
+    classification_samples: int,
+    val_samples: int,
+    total_steps: int,
+) -> None:
+    print(f"\nRun:   {args.output_dir}")
+    print(
+        f"Model: {args.model_type} | {trainable_parameters / 1_000_000:.2f}M params | "
+        f"device={device} | bf16={use_bf16}"
+    )
+    print(
+        f"Data:  segmentation={train_samples} | classification={classification_samples} | "
+        f"validation={val_samples}"
+    )
+    print(
+        f"Loss:  seg_CE(bg={args.background_loss_weight:g}) + "
+        f"{args.dice_weight:g}*Dice + {args.classification_weight:g}*classification_CE"
+    )
+    print(
+        f"Train: epochs={args.epochs} | batch={args.batch_size} | image={args.image_size}px | "
+        f"lr={args.learning_rate:g} | warmup={args.warmup_steps} steps | "
+        f"scheduler={args.scheduler} | total_steps={total_steps:,}"
+    )
+    print(f"Logs:  {args.output_dir / 'metrics.csv'}\n")
+
+
+def print_epoch_summary(metrics: dict[str, object], total_epochs: int) -> None:
+    checkpoint = " | new best" if metrics["best_checkpoint_path"] else ""
+    print(
+        f"epoch {int(metrics['epoch']):03d}/{total_epochs} | "
+        f"lr {float(metrics['learning_rate']):.2e} | "
+        f"{format_duration(float(metrics['epoch_seconds']))} | "
+        f"ETA {format_duration(float(metrics['estimated_remaining_seconds']))}"
+        f"{checkpoint}"
+    )
+    print(
+        f"  train: loss {float(metrics['train_loss']):.4f} | "
+        f"seg_CE {float(metrics['train_seg_ce_loss']):.4f} | "
+        f"Dice {float(metrics['train_dice_loss']):.4f} | "
+        f"classification {float(metrics['train_classification_loss']):.4f} | "
+        f"grad {float(metrics['train_grad_norm']):.3f}"
+    )
+    print(
+        f"  val:   mIoU {float(metrics['val_foreground_mIoU']):.6f} | "
+        f"cls_acc {float(metrics['val_classification_accuracy']):.4f} | "
+        f"foreground pred/gt {float(metrics['val_pred_foreground_fraction']):.3f}/"
+        f"{float(metrics['val_gt_foreground_fraction']):.3f} | "
+        f"predicted classes {int(metrics['val_pred_foreground_classes'])}"
+    )
+
+
 def make_loader(
     dataset: Dataset,
     batch_size: int,
@@ -416,7 +485,14 @@ def validate(
     hist = np.zeros((NUM_SEG_CLASSES, NUM_SEG_CLASSES), dtype=np.int64)
     class_correct = np.zeros(NUM_CLASSES, dtype=np.int64)
     class_total = np.zeros(NUM_CLASSES, dtype=np.int64)
-    for batch in tqdm(loader, total=len(loader), desc=desc, leave=False):
+    for batch in tqdm(
+        loader,
+        total=len(loader),
+        desc=desc,
+        leave=False,
+        bar_format=PROGRESS_BAR_FORMAT,
+        mininterval=0.5,
+    ):
         images = batch["image"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
         class_ids = batch["class_id"].to(device, non_blocking=True)
@@ -703,28 +779,18 @@ def main() -> None:
         )
         best_miou = max(best_miou, checkpoint_miou)
 
-    print(
-        f"Using {len(train_dataset)}/{len(full_train_dataset)} train samples and "
-        f"{len(val_dataset)}/{len(full_val_dataset)} validation samples"
-    )
-    if classification_dataset is not None and full_classification_dataset is not None:
-        print(
-            f"Using {len(classification_dataset)}/{len(full_classification_dataset)} "
-            "classification-labeled samples"
-        )
-    training_mode = "Resuming training" if args.resume is not None else "Training from scratch"
-    print(
-        f"{training_mode} on {len(train_dataset)} train masks; "
-        f"validating on {len(val_dataset)} public masks; device={device}; "
-        f"model_type={args.model_type}; "
-        f"background_loss_weight={args.background_loss_weight}; "
-        f"dice_weight={args.dice_weight}; "
-        f"classification_weight={args.classification_weight}; "
-        f"parameters={trainable_parameters:,}; bf16={use_bf16}; "
-        f"gradient_clipping={args.gradient_clipping}; total_steps={total_steps}"
+    print_run_summary(
+        args=args,
+        device=device,
+        use_bf16=use_bf16,
+        trainable_parameters=trainable_parameters,
+        train_samples=len(train_dataset),
+        classification_samples=len(classification_dataset) if classification_dataset is not None else 0,
+        val_samples=len(val_dataset),
+        total_steps=total_steps,
     )
     if args.resume is not None:
-        print(f"Resuming from {args.resume} at epoch {start_epoch}")
+        print(f"Resume: {args.resume} | starting epoch {start_epoch}\n")
 
     training_started = time.perf_counter()
     for epoch in range(start_epoch, args.epochs + 1):
@@ -740,8 +806,11 @@ def main() -> None:
         train_bar = tqdm(
             enumerate(train_loader, start=1),
             total=len(train_loader),
-            desc=f"epoch {epoch}/{args.epochs} train",
+            desc=f"train {epoch:03d}/{args.epochs}",
             leave=False,
+            bar_format=PROGRESS_BAR_FORMAT,
+            mininterval=0.5,
+            miniters=max(1, args.log_interval),
         )
         for step, batch in train_bar:
             images = batch["image"].to(device, non_blocking=True)
@@ -823,9 +892,8 @@ def main() -> None:
             seen += batch_size
             train_bar.set_postfix(
                 loss=f"{running_loss / max(1, seen):.4f}",
-                seg_ce=f"{running_seg_ce_loss / max(1, seen):.4f}",
-                cls=f"{running_classification_loss / max(1, seen):.4f}",
                 lr=f"{learning_rate:.2e}",
+                refresh=False,
             )
 
         train_loss = running_loss / max(1, seen)
@@ -833,7 +901,7 @@ def main() -> None:
             model,
             val_loader,
             device,
-            desc=f"epoch {epoch}/{args.epochs} val",
+            desc=f"val   {epoch:03d}/{args.epochs}",
             use_bf16=use_bf16,
         )
         val_miou = val_metrics["val_foreground_mIoU"]
@@ -870,7 +938,7 @@ def main() -> None:
         metric_rows.append(epoch_metrics)
         write_metrics(args.output_dir, metric_rows)
         write_summary(args.output_dir, metric_rows, args)
-        print(f"epoch_metrics: {json.dumps(epoch_metrics, sort_keys=True)}")
+        print_epoch_summary(epoch_metrics, args.epochs)
 
 
 if __name__ == "__main__":
