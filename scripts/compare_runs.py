@@ -56,6 +56,7 @@ def summarize_from_metrics(run_dir: Path, metrics: list[dict[str, object]]) -> d
         "final_epoch": int(float(final_row.get("epoch", 0))),
         "final_train_loss": float(final_row.get("train_loss", 0.0)),
         "final_val_foreground_mIoU": float(final_row.get("val_foreground_mIoU", 0.0)),
+        "final_val_classification_accuracy": float(final_row.get("val_classification_accuracy", 0.0)),
         "hyperparameters": hyperparameters,
     }
 
@@ -91,8 +92,11 @@ def main() -> None:
                 "output_dir": str(run_dir),
                 "best_mIoU": float(summary.get("best_val_foreground_mIoU", 0.0)),
                 "best_epoch": int(summary.get("best_epoch", 0)),
+                "model_type": hparams.get("model_type", "small_unet"),
                 "background_loss_weight": hparams.get("background_loss_weight", "-"),
                 "dice_weight": hparams.get("dice_weight", "-"),
+                "classification_weight": hparams.get("classification_weight", "-"),
+                "classification_accuracy": summary.get("final_val_classification_accuracy", "-"),
                 "learning_rate": hparams.get("learning_rate", hparams.get("lr", "-")),
             }
         )
@@ -106,17 +110,21 @@ def main() -> None:
         return
 
     print(
-        f"{'rank':>4}  {'output_dir':<36}  {'best_mIoU':>10}  "
-        f"{'best_epoch':>10}  {'bg_weight':>9}  {'dice_weight':>11}  {'lr':>10}"
+        f"{'rank':>4}  {'output_dir':<36}  {'model':<14}  {'best_mIoU':>10}  "
+        f"{'best_epoch':>10}  {'bg_weight':>9}  {'dice':>7}  {'cls_w':>7}  "
+        f"{'cls_acc':>9}  {'lr':>10}"
     )
     for rank, row in enumerate(summaries, start=1):
         print(
-            f"{rank:>4}  {row['output_dir']:<36}  {format_float(row['best_mIoU']):>10}  "
+            f"{rank:>4}  {row['output_dir']:<36}  {str(row['model_type']):<14}  "
+            f"{format_float(row['best_mIoU']):>10}  "
             f"{row['best_epoch']:>10}  {format_float(row['background_loss_weight'], 4):>9}  "
-            f"{format_float(row['dice_weight'], 4):>11}  {format_float(row['learning_rate'], 6):>10}"
+            f"{format_float(row['dice_weight'], 3):>7}  "
+            f"{format_float(row['classification_weight'], 3):>7}  "
+            f"{format_float(row['classification_accuracy'], 4):>9}  "
+            f"{format_float(row['learning_rate'], 6):>10}"
         )
 
 
 if __name__ == "__main__":
     main()
-

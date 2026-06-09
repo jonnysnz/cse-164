@@ -9,7 +9,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageEnhance
 from torch.utils.data import Dataset
 
 from .constants import IMAGE_EXTENSIONS
@@ -73,14 +73,54 @@ def list_images(image_dir: Path) -> list[Path]:
     )
 
 
-class SegmentationTrainTransform:
-    """Resize image/mask pairs and apply simple shared geometry."""
+def random_crop_box(width: int, height: int, scale_min: float) -> tuple[int, int, int, int]:
+    """Sample a crop that preserves the source aspect ratio."""
+    if not 0 < scale_min <= 1:
+        raise ValueError("crop_scale_min must be in (0, 1]")
+    scale = random.uniform(scale_min, 1.0)
+    crop_width = max(1, round(width * scale**0.5))
+    crop_height = max(1, round(height * scale**0.5))
+    left = random.randint(0, max(0, width - crop_width))
+    top = random.randint(0, max(0, height - crop_height))
+    return left, top, left + crop_width, top + crop_height
 
-    def __init__(self, image_size: int = 256, hflip_prob: float = 0.5) -> None:
+
+def apply_color_jitter(image: Image.Image, strength: float) -> Image.Image:
+    """Apply mild image-only brightness, contrast, and color augmentation."""
+    if strength <= 0:
+        return image
+    transforms = [
+        ImageEnhance.Brightness,
+        ImageEnhance.Contrast,
+        ImageEnhance.Color,
+    ]
+    random.shuffle(transforms)
+    for transform in transforms:
+        factor = random.uniform(max(0.0, 1.0 - strength), 1.0 + strength)
+        image = transform(image).enhance(factor)
+    return image
+
+
+class SegmentationTrainTransform:
+    """Apply paired-safe geometry and image-only color augmentation."""
+
+    def __init__(
+        self,
+        image_size: int = 256,
+        hflip_prob: float = 0.5,
+        color_jitter: float = 0.0,
+        crop_scale_min: float = 1.0,
+    ) -> None:
         self.image_size = image_size
         self.hflip_prob = hflip_prob
+        self.color_jitter = color_jitter
+        self.crop_scale_min = crop_scale_min
 
     def __call__(self, image: Image.Image, mask: Image.Image) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.crop_scale_min < 1.0:
+            box = random_crop_box(image.width, image.height, self.crop_scale_min)
+            image = image.crop(box)
+            mask = mask.crop(box)
         size = (self.image_size, self.image_size)
         image = image.resize(size, BILINEAR)
         # Masks must use nearest-neighbor interpolation so class ids and ignore
@@ -89,7 +129,33 @@ class SegmentationTrainTransform:
         if random.random() < self.hflip_prob:
             image = image.transpose(Image.FLIP_LEFT_RIGHT)
             mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
+        image = apply_color_jitter(image, self.color_jitter)
         return image_to_tensor(image), mask_to_tensor(mask)
+
+
+class ClassificationTrainTransform:
+    """Image-only counterpart to the segmentation training augmentation."""
+
+    def __init__(
+        self,
+        image_size: int = 256,
+        hflip_prob: float = 0.5,
+        color_jitter: float = 0.0,
+        crop_scale_min: float = 1.0,
+    ) -> None:
+        self.image_size = image_size
+        self.hflip_prob = hflip_prob
+        self.color_jitter = color_jitter
+        self.crop_scale_min = crop_scale_min
+
+    def __call__(self, image: Image.Image) -> torch.Tensor:
+        if self.crop_scale_min < 1.0:
+            image = image.crop(random_crop_box(image.width, image.height, self.crop_scale_min))
+        image = image.resize((self.image_size, self.image_size), BILINEAR)
+        if random.random() < self.hflip_prob:
+            image = image.transpose(Image.FLIP_LEFT_RIGHT)
+        image = apply_color_jitter(image, self.color_jitter)
+        return image_to_tensor(image)
 
 
 class ImageResizeTransform:
@@ -230,4 +296,3 @@ class ImageOnlyDataset(Dataset):
             "image_name": image_path.name,
             "original_size": torch.tensor([original_height, original_width], dtype=torch.long),
         }
-

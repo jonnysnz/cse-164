@@ -16,9 +16,9 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from cse164cv.constants import NUM_CLASSES, NUM_SEG_CLASSES  # noqa: E402
+from cse164cv.constants import NUM_CLASSES  # noqa: E402
 from cse164cv.data import ImageOnlyDataset, ImageResizeTransform  # noqa: E402
-from cse164cv.models import SmallUNet  # noqa: E402
+from cse164cv.models import build_model_from_config, split_model_output  # noqa: E402
 from cse164cv.rle import encode_segmentation_rle  # noqa: E402
 
 
@@ -48,28 +48,32 @@ def resolve_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_model(checkpoint_path: Path, device: torch.device) -> tuple[SmallUNet, dict]:
+def load_model(checkpoint_path: Path, device: torch.device) -> tuple[torch.nn.Module, dict]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     config = checkpoint.get("config", {})
-    model = SmallUNet(
-        num_classes=int(config.get("num_seg_classes", NUM_SEG_CLASSES)),
-        base_channels=int(config.get("base_channels", 32)),
-    ).to(device)
+    model = build_model_from_config(config).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     return model, config
 
 
 @torch.no_grad()
-def predict_mask(model: SmallUNet, image: torch.Tensor, original_size: torch.Tensor, device: torch.device) -> np.ndarray:
+def predict_outputs(
+    model: torch.nn.Module,
+    image: torch.Tensor,
+    original_size: torch.Tensor,
+    device: torch.device,
+    constant_class_id: int,
+) -> tuple[np.ndarray, int]:
     image = image.to(device, non_blocking=True)
-    logits = model(image)
+    logits, class_logits = split_model_output(model(image))
     height = int(original_size[0, 0].item())
     width = int(original_size[0, 1].item())
     if logits.shape[-2:] != (height, width):
         logits = F.interpolate(logits, size=(height, width), mode="bilinear", align_corners=False)
     mask = logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint16)
-    return mask
+    class_id = constant_class_id if class_logits is None else int(class_logits.argmax(dim=1).item())
+    return mask, class_id
 
 
 def main() -> None:
@@ -84,7 +88,7 @@ def main() -> None:
     checkpoint_config: dict = {}
     if args.checkpoint:
         model, checkpoint_config = load_model(args.checkpoint, device)
-        print(f"Loaded segmentation checkpoint {args.checkpoint} on {device}")
+        print(f"Loaded model checkpoint {args.checkpoint} on {device}")
     else:
         print("No checkpoint supplied; writing all-background masks.")
 
@@ -116,15 +120,22 @@ def main() -> None:
             if model is not None:
                 if batch["image"].size(0) != 1:
                     raise ValueError("Model prediction currently expects --batch-size 1")
-                mask = predict_mask(model, batch["image"], batch["original_size"], device)
+                mask, class_id = predict_outputs(
+                    model,
+                    batch["image"],
+                    batch["original_size"],
+                    device,
+                    args.constant_class_id,
+                )
             else:
                 height = int(batch["original_size"][0, 0].item())
                 width = int(batch["original_size"][0, 1].item())
                 mask = np.zeros((height, width), dtype=np.uint16)
+                class_id = args.constant_class_id
             writer.writerow(
                 {
                     "image": batch["image_name"][0],
-                    "class_id": args.constant_class_id,
+                    "class_id": class_id,
                     "segmentation_rle": encode_segmentation_rle(mask),
                 }
             )

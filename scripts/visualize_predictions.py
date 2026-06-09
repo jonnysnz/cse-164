@@ -17,9 +17,9 @@ from tqdm.auto import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from cse164cv.constants import IGNORE_INDEX, NUM_CLASSES, NUM_SEG_CLASSES  # noqa: E402
+from cse164cv.constants import IGNORE_INDEX, NUM_CLASSES  # noqa: E402
 from cse164cv.data import ImageResizeTransform, ValidationSegmentationDataset  # noqa: E402
-from cse164cv.models import SmallUNet  # noqa: E402
+from cse164cv.models import build_model_from_config, split_model_output  # noqa: E402
 
 try:
     BILINEAR = Image.Resampling.BILINEAR
@@ -53,13 +53,10 @@ def resolve_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_model(checkpoint_path: Path, device: torch.device) -> tuple[SmallUNet, dict]:
+def load_model(checkpoint_path: Path, device: torch.device) -> tuple[torch.nn.Module, dict]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     config = checkpoint.get("config", {})
-    model = SmallUNet(
-        num_classes=int(config.get("num_seg_classes", NUM_SEG_CLASSES)),
-        base_channels=int(config.get("base_channels", 32)),
-    ).to(device)
+    model = build_model_from_config(config).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     return model, config
@@ -119,9 +116,9 @@ def resize_panel(image: Image.Image, width: int, height: int) -> Image.Image:
 
 
 @torch.no_grad()
-def predict_mask(model: SmallUNet, image: torch.Tensor, original_size: torch.Tensor, device: torch.device) -> np.ndarray:
+def predict_mask(model: torch.nn.Module, image: torch.Tensor, original_size: torch.Tensor, device: torch.device) -> np.ndarray:
     image = image.to(device, non_blocking=True)
-    logits = model(image)
+    logits, _ = split_model_output(model(image))
     height = int(original_size[0, 0].item())
     width = int(original_size[0, 1].item())
     if logits.shape[-2:] != (height, width):
@@ -236,4 +233,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
