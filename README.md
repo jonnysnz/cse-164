@@ -189,7 +189,10 @@ segmentation CE + 0.5 * foreground Dice + 0.1 * classification CE
 ```
 
 It uses paired random crops and flips, image-only color jitter, AdamW, and a
-cosine learning-rate schedule. No pretrained weights are used.
+per-step warmup plus cosine learning-rate schedule. On supported CUDA GPUs it
+uses bfloat16 autocast while keeping model parameters and AdamW state in
+float32. Gradient clipping and non-finite-loss checks stop unstable runs before
+bad checkpoints propagate. No pretrained weights are used.
 
 Verify the complete multi-task path on a tiny deterministic subset:
 
@@ -219,14 +222,14 @@ Resume an interrupted multi-task run:
 ```bash
 python scripts/train_seg.py \
   --config configs/multitask_train.yaml \
-  --resume outputs/multitask_unet_256_100ep/last.pt
+  --resume outputs/multitask_unet_256_100ep_warmup/last.pt
 ```
 
 Generate both required prediction outputs from a multi-task checkpoint:
 
 ```bash
 python scripts/make_submission.py \
-  --checkpoint outputs/multitask_unet_256_100ep/best.pt \
+  --checkpoint outputs/multitask_unet_256_100ep_warmup/best.pt \
   --output submission.csv
 ```
 

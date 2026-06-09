@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import random
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -43,7 +45,13 @@ DEFAULT_CONFIG = {
     "classification_dropout": 0.2,
     "learning_rate": 1e-3,
     "min_learning_rate": 1e-5,
+    "warmup_steps": 0,
     "weight_decay": 1e-4,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.999,
+    "gradient_clipping": False,
+    "gradient_clip_norm": 1.0,
+    "mixed_precision": "auto",
     "background_loss_weight": 0.05,
     "dice_weight": 0.0,
     "classification_weight": 0.0,
@@ -70,6 +78,7 @@ RUN_ARTIFACT_NAMES = {
     "metrics.csv",
     "metrics.json",
     "resolved_config.yaml",
+    "runtime.json",
     "summary.json",
 }
 
@@ -140,7 +149,13 @@ def important_hyperparameters(args: argparse.Namespace) -> dict[str, object]:
         "classification_dropout",
         "learning_rate",
         "min_learning_rate",
+        "warmup_steps",
         "weight_decay",
+        "adam_beta1",
+        "adam_beta2",
+        "gradient_clipping",
+        "gradient_clip_norm",
+        "mixed_precision",
         "background_loss_weight",
         "dice_weight",
         "classification_weight",
@@ -185,7 +200,22 @@ def make_parser(defaults: dict[str, object] | None = None) -> argparse.ArgumentP
     parser.add_argument("--classification-dropout", type=float, default=default("classification_dropout"))
     parser.add_argument("--learning-rate", "--lr", dest="learning_rate", type=float, default=default("learning_rate"))
     parser.add_argument("--min-learning-rate", type=float, default=default("min_learning_rate"))
+    parser.add_argument("--warmup-steps", type=int, default=default("warmup_steps"))
     parser.add_argument("--weight-decay", type=float, default=default("weight_decay"))
+    parser.add_argument("--adam-beta1", type=float, default=default("adam_beta1"))
+    parser.add_argument("--adam-beta2", type=float, default=default("adam_beta2"))
+    parser.add_argument(
+        "--gradient-clipping",
+        action=argparse.BooleanOptionalAction,
+        default=default("gradient_clipping"),
+    )
+    parser.add_argument("--gradient-clip-norm", type=float, default=default("gradient_clip_norm"))
+    parser.add_argument(
+        "--mixed-precision",
+        choices=["auto", "none", "bf16"],
+        default=default("mixed_precision"),
+        help="Use CUDA bfloat16 autocast when supported. Parameters and optimizer state remain float32.",
+    )
     parser.add_argument(
         "--background-loss-weight",
         type=float,
@@ -267,6 +297,54 @@ def resolve_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
+def resolve_bf16(device: torch.device, mixed_precision: str) -> bool:
+    """Enable bfloat16 autocast only on CUDA devices that support it."""
+    supported = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    if mixed_precision == "bf16" and not supported:
+        raise ValueError("--mixed-precision bf16 requires a CUDA GPU with bfloat16 support")
+    return supported and mixed_precision in {"auto", "bf16"}
+
+
+def autocast_context(use_bf16: bool):
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_bf16)
+
+
+def count_trainable_parameters(model: nn.Module) -> int:
+    return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+
+
+def learning_rate_for_step(
+    step: int,
+    total_steps: int,
+    max_lr: float,
+    min_lr: float,
+    warmup_steps: int,
+    scheduler: str,
+) -> float:
+    """Linear warmup followed by optional per-step cosine decay."""
+    if warmup_steps > 0 and step < warmup_steps:
+        return max_lr * float(step + 1) / float(warmup_steps)
+    if scheduler == "none":
+        return max_lr
+    decay_steps = max(1, total_steps - warmup_steps - 1)
+    progress = min(1.0, max(0.0, float(step - warmup_steps) / float(decay_steps)))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + cosine * (max_lr - min_lr)
+
+
+def set_optimizer_learning_rate(optimizer: torch.optim.Optimizer, learning_rate: float) -> None:
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = learning_rate
+
+
+def ensure_finite_loss(loss: torch.Tensor, name: str, epoch: int, step: int) -> None:
+    if not torch.isfinite(loss):
+        raise FloatingPointError(
+            f"Non-finite {name} at epoch {epoch}, step {step}: {float(loss.detach().item())}. "
+            "Check the learning rate, mixed precision, loss weights, and input masks."
+        )
+
+
 def make_loader(
     dataset: Dataset,
     batch_size: int,
@@ -310,7 +388,9 @@ def foreground_dice_loss(logits: torch.Tensor, target: torch.Tensor, smooth: flo
     if present_ids.numel() == 0:
         return logits.sum() * 0.0
 
-    probs = torch.softmax(logits, dim=1)
+    # Keep probability reduction in float32 even when CUDA bf16 autocast is
+    # active; Dice is sensitive to small foreground probabilities.
+    probs = torch.softmax(logits.float(), dim=1)
     fg_probs = probs[:, present_ids, :, :]
     fg_target = (target.unsqueeze(1) == present_ids.view(1, -1, 1, 1)).to(dtype=fg_probs.dtype)
     valid_mask = valid.unsqueeze(1).to(dtype=fg_probs.dtype)
@@ -325,7 +405,13 @@ def foreground_dice_loss(logits: torch.Tensor, target: torch.Tensor, smooth: flo
 
 
 @torch.no_grad()
-def validate(model: nn.Module, loader: DataLoader, device: torch.device, desc: str) -> dict[str, float | int]:
+def validate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    desc: str,
+    use_bf16: bool,
+) -> dict[str, float | int]:
     model.eval()
     hist = np.zeros((NUM_SEG_CLASSES, NUM_SEG_CLASSES), dtype=np.int64)
     class_correct = np.zeros(NUM_CLASSES, dtype=np.int64)
@@ -334,7 +420,8 @@ def validate(model: nn.Module, loader: DataLoader, device: torch.device, desc: s
         images = batch["image"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
         class_ids = batch["class_id"].to(device, non_blocking=True)
-        seg_logits, class_logits = split_model_output(model(images))
+        with autocast_context(use_bf16):
+            seg_logits, class_logits = split_model_output(model(images))
         hist = update_hist_from_logits(hist, seg_logits, masks)
         if class_logits is not None:
             predicted_classes = class_logits.argmax(dim=1)
@@ -364,8 +451,8 @@ def save_checkpoint(
     path: Path,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     epoch: int,
+    global_step: int,
     val_miou: float,
     args: argparse.Namespace,
 ) -> None:
@@ -373,9 +460,9 @@ def save_checkpoint(
     checkpoint = {
         "epoch": epoch,
         "val_miou": val_miou,
+        "global_step": global_step,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
-        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
         "config": {
             **jsonable_config(args),
             "num_classes": NUM_CLASSES,
@@ -394,6 +481,7 @@ def write_metrics(output_dir: Path, rows: list[dict[str, object]]) -> None:
         "train_seg_ce_loss",
         "train_dice_loss",
         "train_classification_loss",
+        "train_grad_norm",
         "val_foreground_mIoU",
         "val_gt_foreground_fraction",
         "val_pred_foreground_fraction",
@@ -401,6 +489,9 @@ def write_metrics(output_dir: Path, rows: list[dict[str, object]]) -> None:
         "val_classification_accuracy",
         "val_classification_macro_accuracy",
         "learning_rate",
+        "epoch_seconds",
+        "elapsed_seconds",
+        "estimated_remaining_seconds",
         "best_checkpoint_path",
     ]
     csv_path = output_dir / "metrics.csv"
@@ -427,6 +518,7 @@ def write_summary(output_dir: Path, rows: list[dict[str, object]], args: argpars
         "final_val_foreground_mIoU": float(final_row["val_foreground_mIoU"]),
         "final_val_classification_accuracy": float(final_row["val_classification_accuracy"]),
         "final_val_classification_macro_accuracy": float(final_row["val_classification_macro_accuracy"]),
+        "final_elapsed_seconds": float(final_row["elapsed_seconds"]),
         "hyperparameters": important_hyperparameters(args),
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True))
@@ -459,15 +551,15 @@ def load_resume_checkpoint(
     checkpoint_path: Path,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     device: torch.device,
-) -> tuple[int, float]:
+    steps_per_epoch: int,
+) -> tuple[int, int, float]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state"])
     optimizer.load_state_dict(checkpoint["optimizer_state"])
-    if scheduler is not None and checkpoint.get("scheduler_state") is not None:
-        scheduler.load_state_dict(checkpoint["scheduler_state"])
-    return int(checkpoint["epoch"]) + 1, float(checkpoint.get("val_miou", -1.0))
+    epoch = int(checkpoint["epoch"])
+    global_step = int(checkpoint.get("global_step", epoch * steps_per_epoch))
+    return epoch + 1, global_step, float(checkpoint.get("val_miou", -1.0))
 
 
 def main() -> None:
@@ -486,11 +578,21 @@ def main() -> None:
         raise ValueError("--crop-scale-min must be in (0, 1]")
     if args.min_learning_rate < 0:
         raise ValueError("--min-learning-rate must be non-negative")
+    if args.min_learning_rate > args.learning_rate:
+        raise ValueError("--min-learning-rate must not exceed --learning-rate")
+    if args.warmup_steps < 0:
+        raise ValueError("--warmup-steps must be non-negative")
+    if not 0 <= args.adam_beta1 < 1 or not 0 <= args.adam_beta2 < 1:
+        raise ValueError("--adam-beta1 and --adam-beta2 must be in [0, 1)")
+    if args.gradient_clip_norm <= 0:
+        raise ValueError("--gradient-clip-norm must be positive")
     if args.resume is not None and not args.resume.is_file():
         raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
 
     seed_everything(args.seed)
     device = resolve_device(args.device)
+    use_bf16 = resolve_bf16(device, args.mixed_precision)
+    torch.set_float32_matmul_precision("high")
     ensure_output_is_available(args.output_dir, args.overwrite_output, args.resume)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     resolved_config = jsonable_config(args)
@@ -560,32 +662,44 @@ def main() -> None:
         "num_seg_classes": NUM_SEG_CLASSES,
     }
     model = build_model_from_config(model_config).to(device)
+    trainable_parameters = count_trainable_parameters(model)
     class_weights = torch.ones(NUM_SEG_CLASSES, dtype=torch.float32, device=device)
     class_weights[0] = args.background_loss_weight
     ce_criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=IGNORE_INDEX)
     classification_criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    scheduler = None
-    if args.scheduler == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=args.epochs,
-            eta_min=args.min_learning_rate,
-        )
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.weight_decay,
+    )
+    total_steps = args.epochs * len(train_loader)
+    if args.warmup_steps >= total_steps:
+        raise ValueError(f"--warmup-steps must be less than total training steps ({total_steps})")
+    runtime_info = {
+        "device": str(device),
+        "bf16_enabled": use_bf16,
+        "trainable_parameters": trainable_parameters,
+        "steps_per_epoch": len(train_loader),
+        "total_steps": total_steps,
+    }
+    (args.output_dir / "runtime.json").write_text(json.dumps(runtime_info, indent=2, sort_keys=True))
 
     metric_rows = load_existing_metrics(args.output_dir) if args.resume is not None else []
+    write_metrics(args.output_dir, metric_rows)
     best_miou = max(
         (float(row["val_foreground_mIoU"]) for row in metric_rows),
         default=-1.0,
     )
     start_epoch = 1
+    global_step = 0
     if args.resume is not None:
-        start_epoch, checkpoint_miou = load_resume_checkpoint(
+        start_epoch, global_step, checkpoint_miou = load_resume_checkpoint(
             args.resume,
             model,
             optimizer,
-            scheduler,
             device,
+            len(train_loader),
         )
         best_miou = max(best_miou, checkpoint_miou)
 
@@ -598,23 +712,29 @@ def main() -> None:
             f"Using {len(classification_dataset)}/{len(full_classification_dataset)} "
             "classification-labeled samples"
         )
+    training_mode = "Resuming training" if args.resume is not None else "Training from scratch"
     print(
-        f"Training from scratch on {len(train_dataset)} train masks; "
+        f"{training_mode} on {len(train_dataset)} train masks; "
         f"validating on {len(val_dataset)} public masks; device={device}; "
         f"model_type={args.model_type}; "
         f"background_loss_weight={args.background_loss_weight}; "
         f"dice_weight={args.dice_weight}; "
-        f"classification_weight={args.classification_weight}"
+        f"classification_weight={args.classification_weight}; "
+        f"parameters={trainable_parameters:,}; bf16={use_bf16}; "
+        f"gradient_clipping={args.gradient_clipping}; total_steps={total_steps}"
     )
     if args.resume is not None:
         print(f"Resuming from {args.resume} at epoch {start_epoch}")
 
+    training_started = time.perf_counter()
     for epoch in range(start_epoch, args.epochs + 1):
+        epoch_started = time.perf_counter()
         model.train()
         running_loss = 0.0
         running_seg_ce_loss = 0.0
         running_dice_loss = 0.0
         running_classification_loss = 0.0
+        running_grad_norm = 0.0
         seen = 0
         classification_iterator = iter(classification_loader) if classification_loader is not None else None
         train_bar = tqdm(
@@ -627,73 +747,110 @@ def main() -> None:
             images = batch["image"].to(device, non_blocking=True)
             masks = batch["mask"].to(device, non_blocking=True)
 
+            learning_rate = learning_rate_for_step(
+                global_step,
+                total_steps,
+                args.learning_rate,
+                args.min_learning_rate,
+                args.warmup_steps,
+                args.scheduler,
+            )
+            set_optimizer_learning_rate(optimizer, learning_rate)
             optimizer.zero_grad(set_to_none=True)
-            seg_logits, seg_class_logits = split_model_output(model(images))
-            ce_loss = ce_criterion(seg_logits, masks)
-            if args.dice_weight > 0:
-                dice_loss = foreground_dice_loss(seg_logits, masks)
-            else:
-                dice_loss = seg_logits.sum() * 0.0
+            with autocast_context(use_bf16):
+                seg_logits, seg_class_logits = split_model_output(model(images))
+                ce_loss = ce_criterion(seg_logits, masks)
+                if args.dice_weight > 0:
+                    dice_loss = foreground_dice_loss(seg_logits, masks)
+                else:
+                    dice_loss = seg_logits.sum() * 0.0
 
-            classification_loss = seg_logits.sum() * 0.0
-            seg_objective = ce_loss + args.dice_weight * dice_loss
-            if classification_iterator is not None:
-                if seg_class_logits is None or not isinstance(model, MultiTaskUNet):
-                    raise RuntimeError("Multi-task classification requires MultiTaskUNet outputs")
-                seg_class_ids = batch["class_id"].to(device, non_blocking=True)
-                seg_classification_loss = classification_criterion(seg_class_logits, seg_class_ids)
-                seg_objective = seg_objective + 0.5 * args.classification_weight * seg_classification_loss
-                try:
-                    classification_batch = next(classification_iterator)
-                except StopIteration:
-                    classification_iterator = iter(classification_loader)
-                    classification_batch = next(classification_iterator)
-            else:
-                seg_classification_loss = classification_loss
-                classification_batch = None
+                classification_loss = seg_logits.sum() * 0.0
+                seg_objective = ce_loss + args.dice_weight * dice_loss
+                if classification_iterator is not None:
+                    if seg_class_logits is None or not isinstance(model, MultiTaskUNet):
+                        raise RuntimeError("Multi-task classification requires MultiTaskUNet outputs")
+                    seg_class_ids = batch["class_id"].to(device, non_blocking=True)
+                    seg_classification_loss = classification_criterion(seg_class_logits, seg_class_ids)
+                    seg_objective = seg_objective + 0.5 * args.classification_weight * seg_classification_loss
+                    try:
+                        classification_batch = next(classification_iterator)
+                    except StopIteration:
+                        classification_iterator = iter(classification_loader)
+                        classification_batch = next(classification_iterator)
+                else:
+                    seg_classification_loss = classification_loss
+                    classification_batch = None
 
             # Backpropagate the segmentation-heavy objective first so the
             # decoder graph can be freed before the image-only forward pass.
+            ensure_finite_loss(seg_objective, "segmentation objective", epoch, step)
             seg_objective.backward()
 
             labeled_classification_loss = classification_loss
             if classification_batch is not None:
                 classification_images = classification_batch["image"].to(device, non_blocking=True)
                 classification_ids = classification_batch["class_id"].to(device, non_blocking=True)
-                labeled_logits = model.forward_classification(classification_images)
-                labeled_classification_loss = classification_criterion(labeled_logits, classification_ids)
-                (0.5 * args.classification_weight * labeled_classification_loss).backward()
+                with autocast_context(use_bf16):
+                    labeled_logits = model.forward_classification(classification_images)
+                    labeled_classification_loss = classification_criterion(labeled_logits, classification_ids)
+                    labeled_objective = 0.5 * args.classification_weight * labeled_classification_loss
+                ensure_finite_loss(labeled_objective, "classification objective", epoch, step)
+                labeled_objective.backward()
 
             if classification_iterator is not None:
                 classification_loss = 0.5 * (seg_classification_loss + labeled_classification_loss)
             loss = ce_loss + args.dice_weight * dice_loss + args.classification_weight * classification_loss
+            ensure_finite_loss(loss, "total loss", epoch, step)
+
+            grad_norm = 0.0
+            if args.gradient_clipping:
+                grad_norm_tensor = nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=args.gradient_clip_norm,
+                    error_if_nonfinite=True,
+                )
+                grad_norm = float(grad_norm_tensor.item())
             optimizer.step()
+            global_step += 1
 
             batch_size = images.size(0)
             running_loss += float(loss.item()) * batch_size
             running_seg_ce_loss += float(ce_loss.item()) * batch_size
             running_dice_loss += float(dice_loss.item()) * batch_size
             running_classification_loss += float(classification_loss.item()) * batch_size
+            running_grad_norm += grad_norm * batch_size
             seen += batch_size
             train_bar.set_postfix(
                 loss=f"{running_loss / max(1, seen):.4f}",
                 seg_ce=f"{running_seg_ce_loss / max(1, seen):.4f}",
                 cls=f"{running_classification_loss / max(1, seen):.4f}",
+                lr=f"{learning_rate:.2e}",
             )
 
         train_loss = running_loss / max(1, seen)
-        val_metrics = validate(model, val_loader, device, desc=f"epoch {epoch}/{args.epochs} val")
+        val_metrics = validate(
+            model,
+            val_loader,
+            device,
+            desc=f"epoch {epoch}/{args.epochs} val",
+            use_bf16=use_bf16,
+        )
         val_miou = val_metrics["val_foreground_mIoU"]
         learning_rate = float(optimizer.param_groups[0]["lr"])
-        if scheduler is not None:
-            scheduler.step()
+        epoch_seconds = time.perf_counter() - epoch_started
+        elapsed_seconds = time.perf_counter() - training_started
+        completed_epochs = epoch - start_epoch + 1
+        estimated_remaining_seconds = (
+            elapsed_seconds / max(1, completed_epochs) * max(0, args.epochs - epoch)
+        )
 
-        save_checkpoint(args.output_dir / "last.pt", model, optimizer, scheduler, epoch, val_miou, args)
+        save_checkpoint(args.output_dir / "last.pt", model, optimizer, epoch, global_step, val_miou, args)
         best_checkpoint_path = ""
         if val_miou > best_miou:
             best_miou = val_miou
             best_path = args.output_dir / "best.pt"
-            save_checkpoint(best_path, model, optimizer, scheduler, epoch, val_miou, args)
+            save_checkpoint(best_path, model, optimizer, epoch, global_step, val_miou, args)
             best_checkpoint_path = str(best_path)
 
         epoch_metrics = {
@@ -702,8 +859,12 @@ def main() -> None:
             "train_seg_ce_loss": running_seg_ce_loss / max(1, seen),
             "train_dice_loss": running_dice_loss / max(1, seen),
             "train_classification_loss": running_classification_loss / max(1, seen),
+            "train_grad_norm": running_grad_norm / max(1, seen),
             **val_metrics,
             "learning_rate": learning_rate,
+            "epoch_seconds": epoch_seconds,
+            "elapsed_seconds": elapsed_seconds,
+            "estimated_remaining_seconds": estimated_remaining_seconds,
             "best_checkpoint_path": best_checkpoint_path,
         }
         metric_rows.append(epoch_metrics)

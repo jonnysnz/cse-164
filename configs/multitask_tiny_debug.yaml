@@ -1,5 +1,5 @@
 data_root: data
-output_dir: outputs/multitask_tiny_debug
+output_dir: outputs/multitask_tiny_debug_warmup
 model_type: multitask_unet
 epochs: 1
 batch_size: 2
@@ -8,7 +8,13 @@ base_channels: 8
 classification_dropout: 0.2
 learning_rate: 0.001
 min_learning_rate: 0.00001
+warmup_steps: 1
 weight_decay: 0.0001
+adam_beta1: 0.9
+adam_beta2: 0.95
+gradient_clipping: true
+gradient_clip_norm: 1.0
+mixed_precision: auto
 background_loss_weight: 0.05
 dice_weight: 0.5
 classification_weight: 0.1
