@@ -47,6 +47,18 @@ DEFAULT_CONFIG = {
     "max_train_samples": None,
     "max_val_samples": None,
     "log_interval": 25,
+    "overwrite_output": False,
+}
+
+RUN_ARTIFACT_NAMES = {
+    "args.json",
+    "best.pt",
+    "config_used.json",
+    "last.pt",
+    "metrics.csv",
+    "metrics.json",
+    "resolved_config.yaml",
+    "summary.json",
 }
 
 
@@ -122,6 +134,7 @@ def important_hyperparameters(args: argparse.Namespace) -> dict[str, object]:
         "max_train_samples",
         "max_val_samples",
         "log_interval",
+        "overwrite_output",
         "config",
     ]
     all_values = jsonable_config(args)
@@ -162,6 +175,12 @@ def make_parser(defaults: dict[str, object] | None = None) -> argparse.ArgumentP
     parser.add_argument("--max-train-samples", type=int, default=default("max_train_samples"))
     parser.add_argument("--max-val-samples", type=int, default=default("max_val_samples"))
     parser.add_argument("--log-interval", type=int, default=default("log_interval"))
+    parser.add_argument(
+        "--overwrite-output",
+        action="store_true",
+        default=default("overwrite_output"),
+        help="Allow replacing checkpoints and metrics already present in --output-dir.",
+    )
     return parser
 
 
@@ -348,12 +367,26 @@ def write_summary(output_dir: Path, rows: list[dict[str, object]], args: argpars
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True))
 
 
+def ensure_output_is_available(output_dir: Path, overwrite_output: bool) -> None:
+    """Prevent separate experiments from silently sharing checkpoints and metrics."""
+    if overwrite_output or not output_dir.exists():
+        return
+    existing_artifacts = sorted(path.name for path in output_dir.iterdir() if path.name in RUN_ARTIFACT_NAMES)
+    if existing_artifacts:
+        artifacts = ", ".join(existing_artifacts)
+        raise FileExistsError(
+            f"Output directory {output_dir} already contains run artifacts: {artifacts}. "
+            "Choose a new --output-dir, or pass --overwrite-output to replace this run."
+        )
+
+
 def main() -> None:
     args = parse_args()
     if args.dice_weight < 0:
         raise ValueError("--dice-weight must be non-negative")
     seed_everything(args.seed)
     device = resolve_device(args.device)
+    ensure_output_is_available(args.output_dir, args.overwrite_output)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     resolved_config = jsonable_config(args)
     (args.output_dir / "args.json").write_text(json.dumps(resolved_config, indent=2, sort_keys=True))

@@ -167,6 +167,31 @@ python starter/validate_submission_csv.py \
   --split val
 ```
 
+## Segmentation Training
+
+Run the current full-data supervised baseline:
+
+```bash
+python scripts/train_seg.py --config configs/seg_train.yaml
+```
+
+Quick Mac smoke test:
+
+```bash
+python scripts/train_seg.py --config configs/seg_mac_quick.yaml
+```
+
+Tiny deterministic debug run:
+
+```bash
+python scripts/train_seg.py --config configs/seg_tiny_debug.yaml
+```
+
+Each config uses a distinct output directory. Training refuses to replace an
+existing run's checkpoints or metrics by default. Prefer changing `output_dir`
+for each experiment. To intentionally replace a run, add
+`--overwrite-output`.
+
 ## Allowed Resources
 
 You may use:
